@@ -1,494 +1,596 @@
-import ZAI from 'z-ai-web-dev-sdk';
-import fs from 'fs';
+const ZAI = require('z-ai-web-dev-sdk');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
 
-let zaiInstance = null;
-let zaiConfig = null;
-
-async function getZAI() {
-  if (!zaiInstance) {
-    zaiInstance = await ZAI.create();
-  }
-  return zaiInstance;
-}
+// ─── Configuration ────────────────────────────────────────────────────────────
 
 function getConfig() {
-  if (zaiConfig) return zaiConfig;
-  const configPaths = [
-    '.z-ai-config',
-    `${process.env.HOME || process.env.USERPROFILE}/.z-ai-config`,
-    '/etc/.z-ai-config'
-  ];
-  for (const p of configPaths) {
-    if (fs.existsSync(p)) {
-      zaiConfig = JSON.parse(fs.readFileSync(p, 'utf8'));
-      return zaiConfig;
-    }
+  // Priority 1: Environment variables (Vercel / production)
+  if (process.env.ZAI_BASE_URL && process.env.ZAI_API_KEY) {
+    return {
+      baseUrl: process.env.ZAI_BASE_URL,
+      apiKey: process.env.ZAI_API_KEY,
+    };
   }
-  throw new Error('.z-ai-config not found');
-}
 
-const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+  // Priority 2: .z-ai-config file (local development)
+  const configPaths = [
+    path.join(process.cwd(), '.z-ai-config'),
+    path.join(os.homedir(), '.z-ai-config'),
+    '/etc/.z-ai-config',
+  ];
 
-async function retryWithBackoff(fn, maxRetries = 3, baseDelay = 3000) {
-  let lastError = null;
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+  for (const configPath of configPaths) {
     try {
-      return await fn();
-    } catch (error) {
-      lastError = error;
-      if (error.message && (
-        error.message.includes('1305') ||
-        error.message.includes('访问量过大') ||
-        error.message.includes('429') ||
-        error.message.includes('rate')
-      )) {
-        if (attempt < maxRetries) {
-          const delay = baseDelay * Math.pow(2, attempt);
-          console.log(`⏳ Traffic overload. Retrying in ${delay / 1000}s... (attempt ${attempt + 1}/${maxRetries})`);
-          await sleep(delay);
-          continue;
+      if (fs.existsSync(configPath)) {
+        const raw = fs.readFileSync(configPath, 'utf-8');
+        const config = JSON.parse(raw);
+        if (config.baseUrl && config.apiKey) {
+          return config;
         }
       }
-      throw error;
-    }
-  }
-  throw lastError;
-}
-
-/* ================================================================
-   STEP 1A: ANALYZE USER PHOTO (body type, pose, skin tone)
-   ================================================================ */
-
-async function analyzeUserPhoto(imageBase64) {
-  const zai = await getZAI();
-  try {
-    const result = await retryWithBackoff(async () => {
-      const response = await zai.chat.completions.create({
-        model: 'glm-4.6v-flash',
-        messages: [
-          {
-            role: 'user',
-            content: [
-              {
-                type: 'text',
-                text: `Analyze this person's physical appearance for a virtual clothing try-on. Describe ONLY:
-1. Body type and build (slim, average, athletic, curvy, plus-size, etc.)
-2. Estimated height (tall, average, short)
-3. Skin tone (fair, light, medium, olive, tan, brown, dark)
-4. Current pose and facing direction (standing front, side pose, sitting, etc.)
-5. Hair length, style, and color
-6. Any distinctive features (beard, glasses, etc.)
-
-Output ONLY the factual description, no suggestions or commentary.`
-              },
-              {
-                type: 'image_url',
-                image_url: { url: imageBase64 }
-              }
-            ]
-          }
-        ]
-      });
-      return response.choices[0].message.content;
-    }, 3, 3000);
-
-    console.log('✅ User photo analysis succeeded!');
-    return result;
-
-  } catch (error) {
-    console.log('⚠️ User photo analysis failed:', error.message);
-    return null;
-  }
-}
-
-/* ================================================================
-   STEP 1B: ANALYZE PRODUCT IMAGE (clothing details, style, fabric)
-   ================================================================ */
-
-async function analyzeProductImage(imageBase64) {
-  const zai = await getZAI();
-  try {
-    const result = await retryWithBackoff(async () => {
-      const response = await zai.chat.completions.create({
-        model: 'glm-4.6v-flash',
-        messages: [
-          {
-            role: 'user',
-            content: [
-              {
-                type: 'text',
-                text: `Analyze this clothing/fashion product image in detail for a virtual try-on. Describe ONLY:
-1. Garment type (dress, shirt, jacket, pants, skirt, suit, etc.)
-2. Exact color(s) and color patterns
-3. Fabric texture and material (silk, cotton, denim, leather, linen, etc.)
-4. Fit and silhouette (fitted, loose, A-line, straight, oversized, etc.)
-5. Key design details (collar type, sleeves, buttons, zippers, pockets, embroidery, prints, etc.)
-6. Length (mini, knee-length, midi, maxi, floor-length for dresses/skirts; short/long for tops)
-7. Style category (casual, formal, business, streetwear, ethnic, sportswear, etc.)
-8. Any visible branding, logos, or text on the garment
-
-Output ONLY the detailed clothing description, no suggestions.`
-              },
-              {
-                type: 'image_url',
-                image_url: { url: imageBase64 }
-              }
-            ]
-          }
-        ]
-      });
-      return response.choices[0].message.content;
-    }, 3, 3000);
-
-    console.log('✅ Product image analysis succeeded!');
-    return result;
-
-  } catch (error) {
-    console.log('⚠️ Product image analysis failed:', error.message);
-    return null;
-  }
-}
-
-/* ================================================================
-   STEP 1C: ANALYZE BOTH IMAGES TOGETHER (advanced fusion analysis)
-   ================================================================ */
-
-async function analyzeBothImages(userImageBase64, productImageBase64) {
-  const zai = await getZAI();
-  try {
-    const result = await retryWithBackoff(async () => {
-      const response = await zai.chat.completions.create({
-        model: 'glm-4.6v-flash',
-        messages: [
-          {
-            role: 'user',
-            content: [
-              {
-                type: 'text',
-                text: `I have TWO images:
-- Image 1: A person's photo
-- Image 2: A clothing product image
-
-Analyze BOTH images together and provide a detailed description for generating a virtual try-on result. Describe:
-
-1. PERSON: Body type, build, height estimate, skin tone, pose, hair style/color
-2. CLOTHING: Garment type, exact colors, fabric, fit, design details, length, style
-3. FIT ASSESSMENT: How this specific clothing would look on this specific person (consider body type, proportions)
-4. STYLING NOTES: Any adjustments needed (tucking, rolling sleeves, belt needed, etc.)
-
-Output a single detailed paragraph that combines all this information. Be specific about colors, fabrics, and how the garment drapes on the body.`
-              },
-              {
-                type: 'image_url',
-                image_url: { url: userImageBase64 }
-              },
-              {
-                type: 'image_url',
-                image_url: { url: productImageBase64 }
-              }
-            ]
-          }
-        ]
-      });
-      return response.choices[0].message.content;
-    }, 3, 3000);
-
-    console.log('✅ Combined image analysis succeeded!');
-    return result;
-
-  } catch (error) {
-    console.log('⚠️ Combined analysis failed:', error.message);
-    return null;
-  }
-}
-
-/* ================================================================
-   STEP 2: IMAGE GENERATION
-   Priority: 1. Pollinations.ai (FREE)  2. BigModel (PAID fallback)
-   ================================================================ */
-
-async function generateTryOnImage(prompt, size = '768x1344') {
-  try {
-    console.log('🎨 Generating image via Pollinations.ai (FREE)...');
-    const base64 = await generateImagePollinations(prompt, size);
-    console.log('✅ Pollinations.ai image generated!');
-    return base64;
-  } catch (error) {
-    console.log('⚠️ Pollinations.ai failed:', error.message);
-  }
-
-  try {
-    console.log('💰 Trying BigModel (cogView-4-250304)...');
-    const base64 = await generateImageBigModel(prompt, size);
-    console.log('✅ BigModel image generated!');
-    return base64;
-  } catch (error) {
-    console.log('❌ BigModel failed:', error.message);
-    throw new Error(
-      'Image generation failed. Both methods failed.\n' +
-      '1. Wait a few minutes and retry\n' +
-      '2. Add balance at https://open.bigmodel.cn for BigModel access'
-    );
-  }
-}
-
-async function generateImagePollinations(prompt, size = '768x1344') {
-  const [width, height] = size.split('x').map(Number);
-  const shortPrompt = prompt.substring(0, 200);
-  const enhancedPrompt = `${shortPrompt}, professional photo, high quality, realistic`;
-  const encodedPrompt = encodeURIComponent(enhancedPrompt);
-
-  for (let attempt = 0; attempt < 3; attempt++) {
-    try {
-      const seed = Date.now() + attempt;
-      const url = `https://image.pollinations.ai/prompt/${encodedPrompt}?width=${width}&height=${height}&nologo=true&seed=${seed}`;
-
-      console.log(`📤 Pollinations attempt ${attempt + 1}/3...`);
-
-      const response = await fetch(url, {
-        method: 'GET',
-        headers: { 'Accept': 'image/*' },
-        signal: AbortSignal.timeout(30000),
-      });
-
-      if (!response.ok) {
-        console.log(`⚠️ Status ${response.status}, retrying...`);
-        await sleep(2000);
-        continue;
-      }
-
-      const contentType = response.headers.get('content-type');
-      if (!contentType || !contentType.includes('image')) {
-        console.log(`⚠️ Not image (${contentType}), retrying...`);
-        await sleep(2000);
-        continue;
-      }
-
-      const arrayBuffer = await response.arrayBuffer();
-      if (arrayBuffer.byteLength < 1000) {
-        console.log(`⚠️ Too small (${arrayBuffer.byteLength} bytes), retrying...`);
-        await sleep(2000);
-        continue;
-      }
-
-      return Buffer.from(arrayBuffer).toString('base64');
-
-    } catch (error) {
-      console.log(`⚠️ Attempt ${attempt + 1} failed: ${error.message}`);
-      if (attempt < 2) await sleep(3000);
+    } catch (_) {
+      // skip invalid files
     }
   }
 
-  throw new Error('Pollinations.ai failed after 3 attempts');
+  throw new Error(
+    'Configuration not found. Set ZAI_BASE_URL + ZAI_API_KEY env vars, or create .z-ai-config file.'
+  );
 }
 
-async function generateImageBigModel(prompt, size = '768x1344') {
+// ─── ZAI Instance with Vercel Fix ─────────────────────────────────────────────
+
+/**
+ * Creates a ZAI SDK instance that works both locally AND on Vercel.
+ *
+ * On Vercel there is no persistent filesystem, so ZAI.create() cannot find
+ * .z-ai-config.  We fix this by writing the config from env vars into /tmp
+ * BEFORE calling ZAI.create(), so the SDK discovers it in its search paths.
+ */
+let _zaiInstance = null;
+
+async function getZAI() {
+  if (_zaiInstance) return _zaiInstance;
+
   const config = getConfig();
-  const url = `${config.baseUrl}/images/generations`;
 
-  const headers = {
-    'Content-Type': 'application/json',
-    'Authorization': `Bearer ${config.apiKey}`,
-    'X-Z-AI-From': 'Z',
-  };
+  // ── Vercel fix: write temp config file so SDK can find it ──
+  const isVercel = !!process.env.VERCEL; // Vercel sets this automatically
+  const tmpConfigPath = '/tmp/.z-ai-config';
+
+  if (isVercel || !fs.existsSync(tmpConfigPath)) {
+    try {
+      fs.writeFileSync(tmpConfigPath, JSON.stringify(config, null, 2), 'utf-8');
+      console.log('[zaiService] Wrote temp config to', tmpConfigPath);
+    } catch (err) {
+      console.warn('[zaiService] Could not write temp config:', err.message);
+    }
+  }
+
+  // The SDK searches: cwd → home → /etc.  On Vercel cwd is /vercel/path,
+  // home may not be writable, and /etc is read-only.  The trick is to
+  // point the SDK at /tmp by temporarily changing cwd during create().
+  const originalCwd = process.cwd();
+
+  try {
+    // Try creating with the current working directory first
+    _zaiInstance = await ZAI.create();
+  } catch (err1) {
+    console.warn('[zaiService] ZAI.create() with default cwd failed:', err1.message);
+
+    // Fallback: change cwd to /tmp where we wrote the config, then create
+    try {
+      process.chdir('/tmp');
+      _zaiInstance = await ZAI.create();
+    } catch (err2) {
+      console.error('[zaiService] ZAI.create() with /tmp cwd also failed:', err2.message);
+
+      // Final fallback: directly use fetch-based calls (no SDK instance needed)
+      console.log('[zaiService] Will use raw fetch() for all API calls');
+      _zaiInstance = null;
+    } finally {
+      // Always restore original cwd
+      process.chdir(originalCwd);
+    }
+  }
+
+  return _zaiInstance;
+}
+
+// ─── Raw Fetch Helper (works without SDK instance) ────────────────────────────
+
+/**
+ * Makes a raw API call to BigModel.  Used as fallback when ZAI.create()
+ * fails entirely, or when the SDK doesn't support an endpoint.
+ */
+async function rawFetch(endpoint, body) {
+  const config = getConfig();
+  const url = `${config.baseUrl}${endpoint}`;
 
   const response = await fetch(url, {
     method: 'POST',
-    headers,
-    body: JSON.stringify({
-      model: 'cogView-4-250304',
-      prompt: prompt,
-      size: size
-    }),
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${config.apiKey}`,
+    },
+    body: JSON.stringify(body),
   });
 
   if (!response.ok) {
-    const errorBody = await response.text();
-    throw new Error(`BigModel failed (${response.status}): ${errorBody}`);
+    const errorText = await response.text();
+    throw new Error(`BigModel API ${response.status}: ${errorText}`);
   }
 
-  const result = await response.json();
-  console.log('📥 BigModel response:', JSON.stringify(result).substring(0, 200));
-
-  if (result.data && Array.isArray(result.data)) {
-    return await extractBase64FromData(result.data);
-  }
-
-  if (result.id) {
-    console.log(`⏳ Async task: ${result.id}`);
-    return await pollBigModelResult(result.id);
-  }
-
-  throw new Error(`Unexpected response: ${JSON.stringify(result).substring(0, 200)}`);
+  return response.json();
 }
 
-async function extractBase64FromData(dataArray) {
-  for (const item of dataArray) {
-    if (item.base64) return item.base64;
-    if (item.url) {
-      console.log('📥 Downloading image from URL...');
-      const imgResponse = await fetch(item.url);
-      if (!imgResponse.ok) throw new Error(`Download failed: ${imgResponse.status}`);
-      return Buffer.from(await imgResponse.arrayBuffer()).toString('base64');
-    }
-  }
-  throw new Error('No image data in response');
-}
+// ─── Retry Utility ────────────────────────────────────────────────────────────
 
-async function pollBigModelResult(taskId, maxAttempts = 30, interval = 5000) {
-  const config = getConfig();
-  const url = `${config.baseUrl}/async-result?id=${encodeURIComponent(taskId)}`;
-  const headers = {
-    'Authorization': `Bearer ${config.apiKey}`,
-    'X-Z-AI-From': 'Z',
-  };
+async function retryWithBackoff(fn, maxRetries = 3, baseDelay = 2000) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      const is429 =
+        err?.response?.status === 429 ||
+        err?.status === 429 ||
+        (err?.message && err.message.includes('429')) ||
+        (err?.message && err.message.includes('1305'));
 
-  for (let i = 0; i < maxAttempts; i++) {
-    console.log(`🔄 Polling ${i + 1}/${maxAttempts}...`);
-    const response = await fetch(url, { headers });
-    if (!response.ok) throw new Error(`Poll failed: ${response.status}`);
-
-    const result = await response.json();
-    console.log(`   Status: ${result.task_status || 'unknown'}`);
-
-    if (result.task_status === 'SUCCESS' || result.task_status === 'SUCCEEDED') {
-      if (result.data) return await extractBase64FromData(result.data);
-      if (result.video_result) return await extractBase64FromData(result.video_result);
-
-      const imgUrl = result.url || result.video_url || result.image_url;
-      if (imgUrl) {
-        const imgResponse = await fetch(imgUrl);
-        return Buffer.from(await imgResponse.arrayBuffer()).toString('base64');
+      if (is429 && attempt < maxRetries) {
+        const delay = baseDelay * Math.pow(2, attempt - 1);
+        console.warn(`[zaiService] Rate limited (attempt ${attempt}/${maxRetries}). Retrying in ${delay}ms…`);
+        await new Promise((r) => setTimeout(r, delay));
+        continue;
       }
-
-      throw new Error(`Task done but no image: ${JSON.stringify(result).substring(0, 300)}`);
+      throw err;
     }
-
-    if (result.task_status === 'FAILED') {
-      throw new Error(`Task failed: ${JSON.stringify(result)}`);
-    }
-
-    await sleep(interval);
   }
-
-  throw new Error('Image generation timed out');
 }
 
-/* ================================================================
-   EXPORTED FUNCTIONS
-   ================================================================ */
+// ─── Image Analysis (Vision) ──────────────────────────────────────────────────
 
 /**
- * FULL TRY-ON: User photo + Product image → Fused try-on result
- * This is the main feature — analyzes both images and generates fusion
- * POST /api/tryon
+ * Analyze a single image using the vision model.
+ * Works with both SDK instance and raw fetch fallback.
  */
-export async function virtualTryOn(userImageBase64, productImageBase64, size = '768x1344') {
-  let userDescription = null;
-  let productDescription = null;
-  let combinedDescription = null;
+async function analyzeImageWithVision(imageDataUrl, prompt) {
+  const config = getConfig();
+  const zai = await getZAI();
 
-  // Step 1: Try combined analysis first (best quality — sees both together)
-  if (userImageBase64 && productImageBase64) {
-    console.log('📸 Step 1: Analyzing user photo + product image together...');
-    combinedDescription = await analyzeBothImages(userImageBase64, productImageBase64);
+  const messages = [
+    {
+      role: 'user',
+      content: [
+        { type: 'text', text: prompt },
+        {
+          type: 'image_url',
+          image_url: { url: imageDataUrl },
+        },
+      ],
+    },
+  ];
 
-    if (combinedDescription) {
-      console.log('🧬 Combined analysis:', combinedDescription);
+  // Try SDK first
+  if (zai) {
+    try {
+      const result = await retryWithBackoff(async () => {
+        const completion = await zai.chat.completions.create({
+          model: 'glm-4.6v-flash',
+          messages,
+          max_tokens: 1024,
+          temperature: 0.7,
+        });
+        return completion.choices?.[0]?.message?.content || '';
+      });
+      return result;
+    } catch (sdkErr) {
+      console.warn('[zaiService] SDK vision call failed, trying raw fetch:', sdkErr.message);
     }
   }
 
-  // Step 2: If combined failed, try individually
-  if (!combinedDescription) {
-    console.log('📸 Step 1a: Analyzing user photo individually...');
-    userDescription = await analyzeUserPhoto(userImageBase64);
+  // Fallback: raw fetch
+  return retryWithBackoff(async () => {
+    const result = await rawFetch('/chat/completions', {
+      model: 'glm-4.6v-flash',
+      messages,
+      max_tokens: 1024,
+      temperature: 0.7,
+    });
+    return result.choices?.[0]?.message?.content || '';
+  });
+}
 
-    console.log('👗 Step 1b: Analyzing product image individually...');
-    productDescription = await analyzeProductImage(productImageBase64);
+/**
+ * Analyze the user's uploaded photo — body type, skin tone, pose, etc.
+ */
+async function analyzeUserPhoto(imageDataUrl) {
+  const prompt = `Analyze this person's photo for a virtual try-on experience. Describe in detail:
+1. Body type and build (slim, average, athletic, curvy, etc.)
+2. Approximate height estimation based on proportions
+3. Skin tone (fair, medium, olive, dark, etc.)
+4. Current pose and posture (standing, sitting, facing direction)
+5. Any visible accessories or existing clothing style
+6. Best clothing fit recommendations for this body type
 
-    if (userDescription) console.log('👤 User:', userDescription);
-    if (productDescription) console.log('👔 Product:', productDescription);
+Be specific and descriptive to help generate an accurate try-on image.`;
+
+  return analyzeImageWithVision(imageDataUrl, prompt);
+}
+
+/**
+ * Analyze the product/clothing image — style, color, fit, etc.
+ */
+async function analyzeProductImage(imageDataUrl) {
+  const prompt = `Analyze this clothing/fashion product image in detail for virtual try-on:
+1. Type of garment (dress, shirt, jacket, pants, etc.)
+2. Color and pattern (solid, striped, floral, etc.)
+3. Fabric type and texture appearance (silk, cotton, denim, leather, etc.)
+4. Fit and cut (slim fit, regular, oversized, A-line, etc.)
+5. Length (crop, waist, knee, ankle, floor-length)
+6. Notable design details (buttons, zippers, embroidery, pockets, etc.)
+7. Style category (casual, formal, streetwear, ethnic, sportswear, etc.)
+8. Season suitability (summer, winter, all-season)
+
+Be specific so the try-on image looks accurate.`;
+
+  return analyzeImageWithVision(imageDataUrl, prompt);
+}
+
+/**
+ * Analyze BOTH images together in a single vision request — the most
+ * effective approach because the model can see the person AND the product
+ * at the same time.
+ */
+async function analyzeBothImages(userImageDataUrl, productImageDataUrl) {
+  const prompt = `You are an AI fashion assistant. Analyze BOTH images together for a virtual try-on:
+
+IMAGE 1: The person who will wear the outfit.
+IMAGE 2: The clothing product to be tried on.
+
+Provide:
+1. Person's body type, build, and skin tone
+2. Product type, color, pattern, and fabric
+3. How well this product suits the person's body type
+4. Suggested styling adjustments (tucking in, rolling sleeves, etc.)
+5. A vivid, detailed description of how the person would look wearing this product — as if describing a photograph
+
+Be highly specific and visual. This description will be used to generate a try-on image.`;
+
+  const config = getConfig();
+  const zai = await getZAI();
+
+  const messages = [
+    {
+      role: 'user',
+      content: [
+        { type: 'text', text: prompt },
+        {
+          type: 'image_url',
+          image_url: { url: userImageDataUrl },
+        },
+        {
+          type: 'image_url',
+          image_url: { url: productImageDataUrl },
+        },
+      ],
+    },
+  ];
+
+  // Try SDK first
+  if (zai) {
+    try {
+      const result = await retryWithBackoff(async () => {
+        const completion = await zai.chat.completions.create({
+          model: 'glm-4.6v-flash',
+          messages,
+          max_tokens: 1500,
+          temperature: 0.7,
+        });
+        return completion.choices?.[0]?.message?.content || '';
+      });
+      return result;
+    } catch (sdkErr) {
+      console.warn('[zaiService] SDK dual-vision call failed, trying raw fetch:', sdkErr.message);
+    }
+  }
+
+  // Fallback: raw fetch
+  return retryWithBackoff(async () => {
+    const result = await rawFetch('/chat/completions', {
+      model: 'glm-4.6v-flash',
+      messages,
+      max_tokens: 1500,
+      temperature: 0.7,
+    });
+    return result.choices?.[0]?.message?.content || '';
+  });
+}
+
+// ─── Image Generation ─────────────────────────────────────────────────────────
+
+/**
+ * Generate try-on image using Pollinations.ai (FREE, no API key required).
+ * Uses a simple GET request that returns an image directly.
+ */
+async function generateImagePollinations(prompt) {
+  // Pollinations has a URL length limit — truncate if needed
+  const maxPromptLen = 800;
+  const truncatedPrompt = prompt.length > maxPromptLen
+    ? prompt.substring(0, maxPromptLen)
+    : prompt;
+
+  const encodedPrompt = encodeURIComponent(truncatedPrompt);
+
+  // Multiple model options for Pollinations
+  const models = ['flux', 'turbo'];
+  const widths = [768, 1024];
+  const height = 1344; // portrait orientation for try-on
+
+  for (const model of models) {
+    for (const width of widths) {
+      const url = `https://image.pollinations.ai/prompt/${encodedPrompt}?width=${width}&height=${height}&model=${model}&nologo=true&seed=${Date.now()}`;
+
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          console.log(`[zaiService] Pollinations.ai attempt ${attempt} (model=${model}, ${width}x${height})`);
+
+          const response = await fetch(url, {
+            method: 'GET',
+            signal: AbortSignal.timeout(60000), // 60s timeout
+          });
+
+          if (!response.ok) {
+            throw new Error(`Pollinations HTTP ${response.status}`);
+          }
+
+          const contentType = response.headers.get('content-type') || '';
+          if (!contentType.includes('image')) {
+            throw new Error(`Pollinations returned non-image: ${contentType}`);
+          }
+
+          const arrayBuffer = await response.arrayBuffer();
+          const buffer = Buffer.from(arrayBuffer);
+
+          if (buffer.length < 5000) {
+            throw new Error(`Image too small (${buffer.length} bytes), likely an error page`);
+          }
+
+          console.log(`[zaiService] Pollinations success! Image size: ${buffer.length} bytes`);
+          return buffer.toString('base64');
+        } catch (err) {
+          console.warn(`[zaiService] Pollinations attempt ${attempt} failed:`, err.message);
+          if (attempt < 3) {
+            await new Promise((r) => setTimeout(r, 2000 * attempt));
+          }
+        }
+      }
+    }
+  }
+
+  throw new Error('All Pollinations.ai attempts failed');
+}
+
+/**
+ * Generate try-on image using BigModel CogView (PAID, requires balance).
+ * Uses raw fetch() because the SDK crashes on async task responses.
+ */
+async function generateImageBigModel(prompt) {
+  const config = getConfig();
+
+  // Step 1: Submit image generation task
+  console.log('[zaiService] Submitting BigModel image generation task…');
+
+  const submitResponse = await fetch(`${config.baseUrl}/images/generations`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${config.apiKey}`,
+    },
+    body: JSON.stringify({
+      model: 'cogView-4-250304', // NOTE: camelCase V is required!
+      prompt: prompt,
+      size: '768x1344',
+    }),
+  });
+
+  if (!submitResponse.ok) {
+    const errorText = await submitResponse.text();
+    throw new Error(`BigModel image submit ${submitResponse.status}: ${errorText}`);
+  }
+
+  const submitData = await submitResponse.json();
+  const taskId = submitData.id;
+
+  if (!taskId) {
+    // Some responses return images directly (synchronous mode)
+    if (submitData.data?.[0]?.url) {
+      const imgResp = await fetch(submitData.data[0].url);
+      const buffer = Buffer.from(await imgResp.arrayBuffer());
+      return buffer.toString('base64');
+    }
+    if (submitData.data?.[0]?.b64_json) {
+      return submitData.data[0].b64_json;
+    }
+    throw new Error('No task ID or image data in BigModel response');
+  }
+
+  // Step 2: Poll for completion (async mode)
+  console.log(`[zaiService] Task ID: ${taskId}, polling for result…`);
+
+  for (let i = 0; i < 30; i++) {
+    await new Promise((r) => setTimeout(r, 2000)); // wait 2s between polls
+
+    const pollResponse = await fetch(`${config.baseUrl}/images/generations/${taskId}`, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${config.apiKey}`,
+      },
+    });
+
+    if (!pollResponse.ok) {
+      console.warn(`[zaiService] Poll ${i + 1} returned ${pollResponse.status}`);
+      continue;
+    }
+
+    const pollData = await pollResponse.json();
+    const taskStatus = pollData.task_status || pollData.status;
+
+    if (taskStatus === 'SUCCESS' || taskStatus === 'SUCCEEDED') {
+      const imageUrl = pollData.data?.[0]?.url;
+      const b64 = pollData.data?.[0]?.b64_json;
+
+      if (b64) return b64;
+
+      if (imageUrl) {
+        const imgResp = await fetch(imageUrl);
+        const buffer = Buffer.from(await imgResp.arrayBuffer());
+        return buffer.toString('base64');
+      }
+
+      throw new Error('BigModel task succeeded but no image in response');
+    }
+
+    if (taskStatus === 'FAIL' || taskStatus === 'FAILED') {
+      throw new Error(`BigModel task failed: ${JSON.stringify(pollData)}`);
+    }
+
+    console.log(`[zaiService] Poll ${i + 1}: status=${taskStatus}`);
+  }
+
+  throw new Error('BigModel image generation timed out after 60s');
+}
+
+/**
+ * Generate try-on image — tries Pollinations.ai first (free), then
+ * BigModel CogView (paid) as fallback.
+ */
+async function generateTryOnImage(prompt) {
+  // Try Pollinations.ai first (free, no API key)
+  try {
+    console.log('[zaiService] Trying Pollinations.ai for image generation…');
+    return await generateImagePollinations(prompt);
+  } catch (pollinationsErr) {
+    console.warn('[zaiService] Pollinations.ai failed:', pollinationsErr.message);
+  }
+
+  // Fallback: BigModel CogView (requires account balance)
+  try {
+    console.log('[zaiService] Trying BigModel CogView for image generation…');
+    return await generateImageBigModel(prompt);
+  } catch (bigModelErr) {
+    console.warn('[zaiService] BigModel CogView failed:', bigModelErr.message);
+  }
+
+  throw new Error('All image generation services failed. Please try again later.');
+}
+
+// ─── Main Try-On Functions ────────────────────────────────────────────────────
+
+/**
+ * Virtual Try-On: user photo + product image → AI fusion image.
+ *
+ * Flow:
+ *  1. Try combined analysis (both images in one vision call)
+ *  2. Fallback: individual analysis of each image
+ *  3. Build detailed fusion prompt from analysis
+ *  4. Generate try-on image using available services
+ */
+async function virtualTryOn(userImageDataUrl, productImageDataUrl) {
+  let userAnalysis = '';
+  let productAnalysis = '';
+  let combinedAnalysis = '';
+  let analysisMethod = 'none';
+
+  // Step 1: Try combined analysis (most effective)
+  try {
+    console.log('[zaiService] Attempting combined dual-image analysis…');
+    combinedAnalysis = await analyzeBothImages(userImageDataUrl, productImageDataUrl);
+    analysisMethod = 'combined';
+    console.log('[zaiService] Combined analysis successful');
+  } catch (err) {
+    console.warn('[zaiService] Combined analysis failed:', err.message);
+  }
+
+  // Step 2: If combined failed, try individual analyses
+  if (!combinedAnalysis) {
+    console.log('[zaiService] Trying individual image analyses…');
+
+    try {
+      userAnalysis = await analyzeUserPhoto(userImageDataUrl);
+    } catch (err) {
+      console.warn('[zaiService] User photo analysis failed:', err.message);
+      userAnalysis = 'A person with average build and medium skin tone, standing straight facing the camera.';
+    }
+
+    try {
+      productAnalysis = await analyzeProductImage(productImageDataUrl);
+    } catch (err) {
+      console.warn('[zaiService] Product image analysis failed:', err.message);
+      productAnalysis = 'A fashionable clothing item with modern design.';
+    }
+
+    analysisMethod = 'individual';
   }
 
   // Step 3: Build the fusion prompt
   let fusionPrompt;
 
-  if (combinedDescription) {
-    // Best case: we have combined analysis
-    fusionPrompt = `Photorealistic full-body fashion photo showing a person wearing the described clothing. ${combinedDescription}. The person is wearing the exact same garment with matching colors, fabric texture, design details, and fit. Studio lighting, clean white background, professional fashion photography, the clothing looks natural and realistically draped on their body.`;
-
-  } else if (userDescription && productDescription) {
-    // Good case: both analyzed individually
-    fusionPrompt = `Photorealistic full-body fashion photo of a person with the following appearance: ${userDescription}. They are wearing the following garment: ${productDescription}. The clothing fits naturally on their body with realistic fabric draping, matching the exact colors, patterns, and design details. Studio lighting, clean white background, professional fashion photography, high quality.`;
-
-  } else if (productDescription) {
-    // Partial: only product analyzed
-    fusionPrompt = `Photorealistic full-body fashion photo of a person wearing the following garment: ${productDescription}. The clothing fits naturally with realistic fabric draping, matching exact colors, patterns, and design details. Studio lighting, clean white background, professional fashion photography, high quality.`;
-
-  } else if (userDescription) {
-    // Partial: only user analyzed (shouldn't happen normally)
-    fusionPrompt = `Photorealistic full-body fashion photo of a person with the following appearance: ${userDescription}. They are wearing fashionable, well-fitted clothing. Studio lighting, clean white background, professional fashion photography, high quality.`;
-
+  if (combinedAnalysis) {
+    fusionPrompt = `Photorealistic full-body virtual try-on photo: ${combinedAnalysis}. The person is wearing the described outfit perfectly. Natural lighting, studio quality, fashion photography style, high detail, the clothing fits naturally on the body, realistic fabric draping and shadows.`;
   } else {
-    // Fallback: no analysis available
-    fusionPrompt = `Photorealistic full-body fashion photo of a person wearing stylish, well-fitted clothing. Studio lighting, clean white background, professional fashion photography, high quality.`;
+    fusionPrompt = `Photorealistic full-body virtual try-on photo of a person with the following characteristics: ${userAnalysis}. They are wearing this outfit: ${productAnalysis}. The clothing fits naturally on their body with realistic fabric draping. Natural lighting, studio quality fashion photography, high detail, professional model pose.`;
   }
 
-  // Step 4: Generate the fusion image
-  console.log('🎨 Step 2: Generating fusion try-on image...');
-  const resultBase64 = await generateTryOnImage(fusionPrompt, size);
+  console.log(`[zaiService] Fusion prompt (${analysisMethod} analysis): ${fusionPrompt.substring(0, 200)}…`);
+
+  // Step 4: Generate the try-on image
+  const imageBase64 = await generateTryOnImage(fusionPrompt);
 
   return {
-    resultImage: resultBase64,
-    userDescription: userDescription,
-    productDescription: productDescription,
-    combinedDescription: combinedDescription
+    imageBase64,
+    analysis: combinedAnalysis || `USER: ${userAnalysis}\nPRODUCT: ${productAnalysis}`,
+    analysisMethod,
+    prompt: fusionPrompt,
   };
 }
 
 /**
- * TEXT-ONLY TRY-ON: User photo + outfit text description
- * Fallback when no product image is available
- * POST /api/tryon/text
+ * Text-only try-on: user photo + text description → AI fusion image.
+ * Used when no product image is available.
  */
-export async function virtualTryOnByText(userImageBase64, outfitDescription, size = '768x1344') {
-  console.log('📸 Step 1: Analyzing user photo...');
-  const userDescription = await analyzeUserPhoto(userImageBase64);
+async function virtualTryOnByText(userImageDataUrl, textPrompt) {
+  let userAnalysis = '';
 
-  let tryOnPrompt;
-  if (userDescription) {
-    console.log('👤 User:', userDescription);
-    tryOnPrompt = `Photorealistic full-body fashion photo of a person with the following appearance: ${userDescription}. They are wearing: ${outfitDescription}. The clothing fits naturally with realistic fabric draping. Studio lighting, clean white background, professional fashion photography, high quality.`;
-  } else {
-    console.log('📝 Using outfit-only prompt...');
-    tryOnPrompt = `Photorealistic full-body fashion photo of a person wearing: ${outfitDescription}. Studio lighting, clean white background, professional fashion photography, high quality.`;
+  try {
+    userAnalysis = await analyzeUserPhoto(userImageDataUrl);
+  } catch (err) {
+    console.warn('[zaiService] User photo analysis failed:', err.message);
+    userAnalysis = 'A person with average build and medium skin tone, standing straight.';
   }
 
-  console.log('🎨 Step 2: Generating try-on image...');
-  const resultBase64 = await generateTryOnImage(tryOnPrompt, size);
+  const fusionPrompt = `Photorealistic full-body virtual try-on photo of a person with the following characteristics: ${userAnalysis}. They are wearing: ${textPrompt}. The clothing fits naturally with realistic fabric draping and shadows. Natural lighting, studio quality fashion photography, high detail, professional model pose.`;
+
+  console.log(`[zaiService] Text try-on prompt: ${fusionPrompt.substring(0, 200)}…`);
+
+  const imageBase64 = await generateTryOnImage(fusionPrompt);
 
   return {
-    resultImage: resultBase64,
-    userDescription: userDescription,
-    productDescription: null,
-    combinedDescription: null
+    imageBase64,
+    analysis: userAnalysis,
+    analysisMethod: 'text-only',
+    prompt: fusionPrompt,
   };
 }
 
-/**
- * Generate outfit image only (no user photo)
- * POST /api/outfit/generate
- */
-export async function generateOutfitImage(prompt) {
-  const outfitPrompt = `Full-body fashion photo of a model wearing: ${prompt}. Professional fashion photography, studio lighting, clean background, high quality.`;
-  return await generateTryOnImage(outfitPrompt, '768x1344');
-}
+// ─── Exports ──────────────────────────────────────────────────────────────────
 
-/**
- * Analyze body type only
- * POST /api/analyze
- */
-export async function analyzeBodyType(imageBase64) {
-  const description = await analyzeUserPhoto(imageBase64);
-  return description || 'Unable to analyze — vision models are currently overloaded.';
-}
+module.exports = {
+  virtualTryOn,
+  virtualTryOnByText,
+  analyzeUserPhoto,
+  analyzeProductImage,
+  generateTryOnImage,
+};

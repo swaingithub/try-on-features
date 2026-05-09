@@ -13,7 +13,10 @@ const router = Router();
 // Multer config — supports multiple file fields
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
-    cb(null, path.join(process.cwd(), 'uploads', 'temp'));
+    const uploadDir = process.env.VERCEL 
+      ? '/tmp' 
+      : path.join(process.cwd(), 'uploads', 'temp');
+    cb(null, uploadDir);
   },
   filename: (req, file, cb) => {
     cb(null, `${Date.now()}-${file.originalname}`);
